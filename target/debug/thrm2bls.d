@@ -1,0 +1,1 @@
+/Users/eddyguerra/Documents/Fri-Project/thrm2bls/target/debug/thrm2bls: /Users/eddyguerra/Documents/Fri-Project/thrm2bls/src/fri.rs /Users/eddyguerra/Documents/Fri-Project/thrm2bls/src/main.rs /Users/eddyguerra/Documents/Fri-Project/thrm2bls/src/polynomial.rs
