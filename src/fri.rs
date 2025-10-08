@@ -59,28 +59,48 @@ impl FriProver {
 
             let mut layer_queries = Vec::new();
             let mut current_index = index;
+            let last_idx = commitment.layers.len() - 1;
 
-            for layer_idx in 0..commitment.layers.len().saturating_sub(1) {
+            // Include final layer in query generation
+            for layer_idx in 0..commitment.layers.len() {
                 let layer = &commitment.layers[layer_idx];
-                let domain_size = layer.evaluations.len();
-                let half = domain_size / 2;
 
-                let query_index = current_index % half;
-                let sym_index = query_index + half;
+                if layer_idx < last_idx {
+                    // Regular layer: fetch both evaluation and symmetric evaluation
+                    let domain_size = layer.evaluations.len();
+                    let half = domain_size / 2;
 
-                let (eval, auth_path) = layer.get_evaluation_with_proof(query_index);
-                let (eval_sym, auth_path_sym) = layer.get_evaluation_with_proof(sym_index);
+                    let query_index = current_index % half;
+                    let sym_index = query_index + half;
 
-                layer_queries.push(FriQuery {
-                    layer_index: layer_idx,
-                    evaluation_index: query_index,
-                    evaluation: eval,
-                    evaluation_sym: eval_sym,
-                    auth_path,
-                    auth_path_sym,
-                });
+                    let (eval, auth_path) = layer.get_evaluation_with_proof(query_index);
+                    let (eval_sym, auth_path_sym) = layer.get_evaluation_with_proof(sym_index);
 
-                current_index = query_index;
+                    layer_queries.push(FriQuery {
+                        layer_index: layer_idx,
+                        evaluation_index: query_index,
+                        evaluation: eval,
+                        evaluation_sym: eval_sym,
+                        auth_path,
+                        auth_path_sym,
+                    });
+
+                    current_index = query_index;
+                } else {
+                    // Final layer: only one evaluation (no symmetric pair since folding terminates)
+                    let query_index = current_index;
+                    let (eval, auth_path) = layer.get_evaluation_with_proof(query_index);
+
+                    layer_queries.push(FriQuery {
+                        layer_index: layer_idx,
+                        evaluation_index: query_index,
+                        evaluation: eval,
+                        evaluation_sym: G1Projective::identity(), // Dummy value for final layer
+                        auth_path,
+                        auth_path_sym: Vec::new(), // Empty for final layer
+                    });
+                    // Do not update current_index after final layer
+                }
             }
 
             all_queries.push(layer_queries);
@@ -158,54 +178,67 @@ impl FriVerifier {
         betas: &[Scalar],
         _query_idx: usize,
     ) -> bool {
+        let last_idx = commitment.layers.len() - 1;
+
         for (i, query) in layer_queries.iter().enumerate() {
             let layer = &commitment.layers[query.layer_index];
 
-            // Verify Merkle proofs
-            let leaf = query.evaluation.to_affine().to_compressed();
-            if !MerkleTree::verify_authentication_path(
-                layer.merkle_tree.root(),
-                &leaf,
-                query.evaluation_index,
-                &query.auth_path,
-            ) {
-                return false;
-            }
-
-            let domain_size = layer.evaluations.len();
-            let sym_index = query.evaluation_index + domain_size / 2;
-            let leaf_sym = query.evaluation_sym.to_affine().to_compressed();
-            if !MerkleTree::verify_authentication_path(
-                layer.merkle_tree.root(),
-                &leaf_sym,
-                sym_index,
-                &query.auth_path_sym,
-            ) {
-                return false;
-            }
-
-            // Verify folding - use layer_index to get correct beta
-            if i < layer_queries.len() - 1 {
-                let beta = betas[query.layer_index];
-                let x = layer.domain[query.evaluation_index];
-                let two_inv = Scalar::from(2).invert().unwrap();
-                let x_inv = x.invert().unwrap();
-
-                let even = (query.evaluation + query.evaluation_sym) * two_inv;
-                let odd = (query.evaluation - query.evaluation_sym) * two_inv * x_inv * beta;
-                let expected = even + odd;
-
-                if expected != layer_queries[i + 1].evaluation {
+            if query.layer_index < last_idx {
+                // Regular layer: verify both Merkle proofs and folding relation
+                let leaf = query.evaluation.to_affine().to_compressed();
+                if !MerkleTree::verify_authentication_path(
+                    layer.merkle_tree.root(),
+                    &leaf,
+                    query.evaluation_index,
+                    &query.auth_path,
+                ) {
                     return false;
                 }
-            }
-        }
 
-        // Verify final evaluation matches commitment
-        if let Some(last_query) = layer_queries.last() {
-            let final_layer = &commitment.layers.last().unwrap();
-            if final_layer.evaluations[last_query.evaluation_index] != commitment.final_value {
-                return false; // Final evaluation doesn't match
+                let domain_size = layer.evaluations.len();
+                let sym_index = query.evaluation_index + domain_size / 2;
+                let leaf_sym = query.evaluation_sym.to_affine().to_compressed();
+                if !MerkleTree::verify_authentication_path(
+                    layer.merkle_tree.root(),
+                    &leaf_sym,
+                    sym_index,
+                    &query.auth_path_sym,
+                ) {
+                    return false;
+                }
+
+                // Verify folding - use layer_index to get correct beta
+                if i < layer_queries.len() - 1 {
+                    let beta = betas[query.layer_index];
+                    let x = layer.domain[query.evaluation_index];
+                    let two_inv = Scalar::from(2).invert().unwrap();
+                    let x_inv = x.invert().unwrap();
+
+                    let even = (query.evaluation + query.evaluation_sym) * two_inv;
+                    let odd = (query.evaluation - query.evaluation_sym) * two_inv * x_inv * beta;
+                    let expected = even + odd;
+
+                    if expected != layer_queries[i + 1].evaluation {
+                        return false;
+                    }
+                }
+            } else {
+                // Final layer: verify only the single evaluation's Merkle proof (no symmetric pair)
+                let leaf = query.evaluation.to_affine().to_compressed();
+                if !MerkleTree::verify_authentication_path(
+                    layer.merkle_tree.root(),
+                    &leaf,
+                    query.evaluation_index,
+                    &query.auth_path,
+                ) {
+                    return false; // Final layer Merkle proof failed
+                }
+
+                // Verify final evaluation matches commitment
+                if query.evaluation != commitment.final_value {
+                    return false; // Final evaluation doesn't match
+                }
+                // Skip folding on final layer (there is no next layer)
             }
         }
 
@@ -1212,5 +1245,46 @@ mod tests {
         let valid = verifier.verify(&commitment, &decommitment, &mut verifier_transcript);
 
         assert!(valid, "Verifier should accept valid proof");
+    }
+
+    #[test]
+    fn test_final_layer_merkle_path_tamper_fails() {
+        // Test that tampering with final layer auth path causes verification to fail
+        let generator = G1Projective::generator();
+        let prover = FriProver::new(generator);
+        let verifier = FriVerifier::new(generator);
+
+        // Create a small commitment
+        let domain = generate_evaluation_domain(16, Scalar::from(3));
+        let evals: Vec<G1Projective> = (0..16)
+            .map(|i| generator * Scalar::from(i as u64))
+            .collect();
+
+        let mut prover_transcript = Transcript::new(b"TAMPER_TEST");
+        let commitment = prover.commit(
+            &evals,
+            domain,
+            3,                  // degree_bound (will have final layer of size 4)
+            Scalar::from(3),    // base_offset
+            Scalar::from(5),    // extended_offset
+            2,                  // blowup_factor
+            &mut prover_transcript
+        );
+
+        // Generate one query
+        let mut decommitment = prover.generate_queries(&commitment, 1, &mut prover_transcript);
+
+        // Tamper with the final layer's auth path
+        let last_query_idx = decommitment.queries[0].len() - 1;
+        if !decommitment.queries[0][last_query_idx].auth_path.is_empty() {
+            // Flip one byte in the first hash of the auth path
+            decommitment.queries[0][last_query_idx].auth_path[0][0] ^= 0x01;
+        }
+
+        // Verify should fail due to tampered auth path
+        let mut verifier_transcript = Transcript::new(b"TAMPER_TEST");
+        let valid = verifier.verify(&commitment, &decommitment, &mut verifier_transcript);
+
+        assert!(!valid, "Verification should fail when final layer auth path is tampered");
     }
 }
