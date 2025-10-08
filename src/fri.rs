@@ -1,10 +1,13 @@
 // fri.rs - Sound FRI protocol with all critical fixes
 use bls12_381::{G1Projective, Scalar};
-use ff::Field;
+use ff::{Field, PrimeField};
 use group::Curve;
 use sha2::{Digest, Sha256};
 
 use crate::polynomial::{Polynomial, EncapsulatedPolynomial, LagrangeInterpolation, VanishingPolynomial};
+
+// Security parameter: number of queries for soundness
+const DEFAULT_NUM_QUERIES: usize = 10;
 
 // ============================================================================
 // FRI QUERIES AND DECOMMITMENT
@@ -149,9 +152,9 @@ impl FriVerifier {
                 return false;
             }
 
-            // Verify folding
+            // Verify folding - use layer_index to get correct beta
             if i < layer_queries.len() - 1 {
-                let beta = betas[i];
+                let beta = betas[query.layer_index];
                 let x = layer.domain[query.evaluation_index];
                 let two_inv = Scalar::from(2).invert().unwrap();
                 let x_inv = x.invert().unwrap();
@@ -210,15 +213,32 @@ impl ProofGenerator {
         public_keys: &[G1Projective],
         weights: &[Scalar],
     ) -> AggregationProof {
-        println!("\n🔒 Generating FRI-based aggregation proof...");
+        self.generate_aggregation_proof_with_queries(
+            signing_set,
+            n,
+            public_keys,
+            weights,
+            DEFAULT_NUM_QUERIES,
+        )
+    }
+
+    pub fn generate_aggregation_proof_with_queries(
+        &self,
+        signing_set: &[usize],
+        n: usize,
+        public_keys: &[G1Projective],
+        weights: &[Scalar],
+        num_queries: usize,
+    ) -> AggregationProof {
+        println!("\n🔐 Generating FRI-based aggregation proof...");
 
         let b_values = self.construct_indicator_values(signing_set, n);
-        let b_commitment = self.commit_to_indicator(&b_values);
+        let b_commitment = self.commit_to_indicator(&b_values, n);
 
         println!("  Step 1: Computing quotient polynomials");
         let sk_quotients = self.compute_sk_quotients(public_keys, &b_values, n);
 
-        // FIX #2: Proper LDE using barycentric interpolation
+        // Linear encoding: we have evaluations f(x)·G at base domain
         println!("  Step 2: Performing low-degree extension (LDE)");
 
         let base_size = sk_quotients.q_x.evaluations.len();
@@ -237,16 +257,16 @@ impl ProofGenerator {
         let extended_offset = Scalar::from(11); // Different coset
         let extended_domain = generate_evaluation_domain(extended_size, extended_offset);
 
-        // Perform proper LDE: interpolate in the exponent
+        // Perform proper LDE: interpolate in linear encoding
         println!("  Step 4: Interpolating {} → {} points", base_size, extended_size);
         let mut extended_evals = Vec::with_capacity(extended_size);
 
         for (i, &z) in extended_domain.iter().enumerate() {
             if i % (extended_size / 10) == 0 {
-                println!("    Progress: {}/{}",i, extended_size);
+                println!("    Progress: {}/{}", i, extended_size);
             }
-            // Use barycentric formula to evaluate g^{f(z)}
-            let eval = eval_in_exponent(
+            // Use barycentric formula to evaluate f(z)·G from f(x_j)·G
+            let eval = eval_linear_encoding_barycentric(
                 &base_domain,
                 &sk_quotients.q_x.evaluations,
                 &bary_weights,
@@ -257,6 +277,14 @@ impl ProofGenerator {
 
         println!("  Step 5: Generating FRI commitment");
         let mut transcript = Transcript::new(b"AGGREGATION_PROOF");
+
+        // Bind public parameters to transcript
+        transcript.absorb(b"PARAMS_V1", &(extended_size as u64).to_le_bytes());
+        transcript.absorb(b"PARAMS_V1", &((base_size - 1) as u64).to_le_bytes()); // degree_bound
+        transcript.absorb(b"PARAMS_V1", &(blowup_factor as u64).to_le_bytes());
+        transcript.absorb(b"PARAMS_V1", &base_offset.to_bytes());
+        transcript.absorb(b"PARAMS_V1", &extended_offset.to_bytes());
+
         let degree_bound = base_size - 1;
 
         let fri_commitment = self.fri_prover.commit(
@@ -269,16 +297,22 @@ impl ProofGenerator {
         println!("  Step 6: Generating query proofs");
         let fri_decommitment = self.fri_prover.generate_queries(
             &fri_commitment,
-            10,
+            num_queries,
             &mut transcript
         );
 
-        let proof_size = self.estimate_proof_size(extended_size, 10);
+        let proof_size = self.estimate_proof_size(extended_size, num_queries);
+
+        // Estimate failure probability: ρ ≈ (deg/n)^num_queries
+        let rate = (degree_bound as f64) / (extended_size as f64);
+        let failure_prob = rate.powi(num_queries as i32);
 
         println!("  ✓ Proof generated!");
         println!("    Base domain: {} points", base_size);
         println!("    Extended domain: {} points", extended_size);
         println!("    Blowup factor: {}x", blowup_factor);
+        println!("    Num queries: {}", num_queries);
+        println!("    Estimated failure probability: ~{:.2e}", failure_prob);
         println!("    Proof size: ~{} bytes", proof_size);
 
         AggregationProof {
@@ -299,11 +333,16 @@ impl ProofGenerator {
         b_values
     }
 
-    fn commit_to_indicator(&self, b_values: &[Scalar]) -> Vec<u8> {
+    fn commit_to_indicator(&self, b_values: &[Scalar], n: usize) -> Vec<u8> {
         let mut hasher = Sha256::new();
         hasher.update(b"INDICATOR");
+        // Absorb n first
+        hasher.update(&(n as u64).to_le_bytes());
+        // Length-prefix each scalar
         for &val in b_values {
-            hasher.update(&val.to_bytes());
+            let bytes = val.to_bytes();
+            hasher.update(&(bytes.len() as u32).to_le_bytes());
+            hasher.update(&bytes);
         }
         hasher.finalize().to_vec()
     }
@@ -357,26 +396,8 @@ impl ProofGenerator {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_transcript() {
-        let mut t = Transcript::new(b"test");
-        t.absorb(b"data1", b"value1");
-        let c1 = t.challenge_scalar(b"challenge");
-        assert!(c1 != Scalar::ZERO);
-    }
-
-    #[test]
-    fn test_domain_generation() {
-        let domain = generate_evaluation_domain(8, Scalar::from(2));
-        assert_eq!(domain.len(), 8);
-        assert!(domain[0] != Scalar::ZERO);
-    }
-}
-// FIAT-SHAMIR TRANSCRIPT (CRITICAL FIX #3)
+// ============================================================================
+// FIAT-SHAMIR TRANSCRIPT
 // ============================================================================
 
 pub struct Transcript {
@@ -416,48 +437,61 @@ impl Transcript {
 }
 
 // ============================================================================
-// ROOTS OF UNITY (CRITICAL FIX #1)
+// ROOTS OF UNITY
 // ============================================================================
 
-/// Get primitive 2^k root of unity for BLS12-381 scalar field
-/// BLS12-381 has 2-adicity of 32
+/// Get primitive 2^k root of unity for BLS12-381 scalar field.
+/// BLS12-381 Fr has 2-adicity of 32, so we can support domains up to 2^32.
+///
+/// Derives the root by taking ROOT_OF_UNITY (a 2^S root) and raising it
+/// to the power 2^(S-k) to obtain a primitive 2^k root.
 pub fn primitive_root_of_unity_pow2(k: usize) -> Option<Scalar> {
-    if k > 32 {
-        return None; // BLS12-381 Fr has 2-adicity 32
+    let two_adicity = Scalar::S as usize;
+
+    if k > two_adicity {
+        return None;
     }
 
-    // Known 2^32 root of unity for BLS12-381 scalar field
-    // This is a placeholder - in production, use the actual root
-    // For BLS12-381: multiplicative_generator^((r-1)/2^32)
-    let base = Scalar::from(7);
-    let mut root = base;
+    // Start with the primitive 2^S root of unity
+    let mut root = Scalar::ROOT_OF_UNITY;
 
-    // Raise to appropriate power to get 2^k root
-    for _ in 0..(32 - k) {
+    // Square (S - k) times to get a 2^k root
+    for _ in 0..(two_adicity - k) {
         root = root.square();
     }
 
     Some(root)
 }
 
-/// Generate evaluation domain D = {ω^0, ω^1, ..., ω^(n-1)} with coset offset
-pub fn generate_evaluation_domain(domain_size: usize, coset_offset: Scalar) -> Vec<Scalar> {
+/// Generate evaluation domain D = {ω^0, ω^1, ..., ω^(n-1)} with coset offset.
+///
+/// The coset offset is deterministically adjusted to ensure it is not in the
+/// multiplicative subgroup of order n. If the initial offset is 1 or has order
+/// dividing n, it is bumped starting from 11 until offset^n ≠ 1.
+pub fn generate_evaluation_domain(domain_size: usize, mut coset_offset: Scalar) -> Vec<Scalar> {
     assert!(domain_size.is_power_of_two(), "Domain size must be power of 2");
-    assert!(domain_size <= (1 << 32), "Domain too large for 2-adicity");
 
     let k = domain_size.trailing_zeros() as usize;
+    let two_adicity = Scalar::S as usize;
+    assert!(k <= two_adicity, "Domain too large for 2-adicity");
+
     let omega = primitive_root_of_unity_pow2(k).expect("No root of unity for size");
 
-    // Verify coset_offset is not in the subgroup
-    // Only check if offset != 1 (identity is always in subgroup)
-    if coset_offset != Scalar::ONE {
-        let offset_power = coset_offset.pow_vartime(&[domain_size as u64, 0, 0, 0]);
-        if offset_power == Scalar::ONE {
-            // Offset is in subgroup, use a safe alternative
-            // Multiply by a known non-subgroup element
-            let safe_offset = coset_offset * Scalar::from(3);
-            return generate_evaluation_domain_unchecked(domain_size, omega, safe_offset);
+    // Deterministically bump offset until it's not in the subgroup
+    let mut candidate = if coset_offset == Scalar::ONE {
+        Scalar::from(11)
+    } else {
+        coset_offset
+    };
+
+    loop {
+        let candidate_power = candidate.pow_vartime(&[domain_size as u64, 0, 0, 0]);
+        if candidate_power != Scalar::ONE {
+            coset_offset = candidate;
+            break;
         }
+        // Bump to next candidate
+        candidate += Scalar::ONE;
     }
 
     generate_evaluation_domain_unchecked(domain_size, omega, coset_offset)
@@ -477,10 +511,11 @@ fn generate_evaluation_domain_unchecked(domain_size: usize, omega: Scalar, coset
 }
 
 // ============================================================================
-// BARYCENTRIC INTERPOLATION IN EXPONENT (CRITICAL FIX #2)
+// BARYCENTRIC INTERPOLATION IN LINEAR ENCODING
 // ============================================================================
 
-/// Precompute barycentric weights for domain X = {x_j}
+/// Precompute barycentric weights for domain X = {x_j}.
+///
 /// w_j = 1 / ∏_{m≠j} (x_j - x_m)
 fn barycentric_weights(xs: &[Scalar]) -> Vec<Scalar> {
     let n = xs.len();
@@ -499,10 +534,18 @@ fn barycentric_weights(xs: &[Scalar]) -> Vec<Scalar> {
     w
 }
 
-/// Evaluate g^{f(z)} from {g^{f(x_j)}} via barycentric formula
-/// λ_j(z) = w_j / (z - x_j); Λ(z) = Σ λ_j(z)
-/// g^{f(z)} = Σ (λ_j(z)/Λ(z)) · g^{f(x_j)}
-fn eval_in_exponent(
+/// Evaluate f(z)·G from {f(x_j)·G} via barycentric formula in linear encoding.
+///
+/// Linear encoding interpretation: each base_vals[j] represents f(x_j)·G,
+/// where G is the elliptic curve generator and f is a polynomial.
+///
+/// Using barycentric weights:
+/// - λ_j(z) = w_j / (z - x_j)
+/// - Λ(z) = Σ λ_j(z)
+/// - f(z)·G = Σ (λ_j(z)/Λ(z)) · (f(x_j)·G)
+///
+/// Returns f(z)·G as a group element.
+fn eval_linear_encoding_barycentric(
     base_points: &[Scalar],
     base_vals: &[G1Projective],
     w: &[Scalar],
@@ -529,7 +572,7 @@ fn eval_in_exponent(
 }
 
 // ============================================================================
-// MERKLE TREE WITH DOMAIN SEPARATION (FIX #4)
+// MERKLE TREE WITH DOMAIN SEPARATION
 // ============================================================================
 
 fn leaf_hash_g1(bytes: &[u8]) -> Vec<u8> {
@@ -660,6 +703,16 @@ pub struct FriLayer {
 impl FriLayer {
     pub fn new(evaluations: Vec<G1Projective>, domain: Vec<Scalar>) -> Self {
         assert_eq!(evaluations.len(), domain.len());
+
+        // Domain pairing invariant: ω^(n/2) = -1 for proper folding
+        if domain.len() >= 2 {
+            let half = domain.len() / 2;
+            let omega = domain[1] * domain[0].invert().unwrap();
+            let omega_half = omega.pow_vartime(&[half as u64, 0, 0, 0]);
+            debug_assert_eq!(omega_half, -Scalar::ONE,
+                             "Domain pairing invariant violated: ω^(n/2) must equal -1");
+        }
+
         let merkle_tree = MerkleTree::build_from_group_elements(&evaluations);
         Self { evaluations, merkle_tree, domain }
     }
@@ -725,6 +778,10 @@ impl FriProver {
         Self { generator }
     }
 
+    /// Commit to evaluations using FRI protocol.
+    ///
+    /// Folds the domain until the final layer has at most degree_bound + 1 elements,
+    /// ensuring the committed polynomial has degree at most degree_bound.
     pub fn commit(
         &self,
         initial_evaluations: &[G1Projective],
@@ -735,8 +792,6 @@ impl FriProver {
         assert!(initial_evaluations.len().is_power_of_two());
         assert_eq!(initial_evaluations.len(), initial_domain.len());
 
-        let rounds = (degree_bound.next_power_of_two().trailing_zeros()) as usize;
-
         let mut layers = Vec::new();
         let mut current_evals = initial_evaluations.to_vec();
         let mut current_domain = initial_domain;
@@ -746,12 +801,9 @@ impl FriProver {
         transcript.absorb(b"layer_0", layer.merkle_tree.root());
         layers.push(layer);
 
-        // Folding rounds
-        for round in 0..rounds {
-            if current_evals.len() <= 1 {
-                break;
-            }
-
+        // Folding rounds: continue while current size > degree_bound + 1
+        let mut round = 0;
+        while current_evals.len() > degree_bound + 1 {
             let beta = transcript.challenge_scalar(&format!("beta_{}", round).as_bytes());
             let (folded_evals, folded_domain) = fold_polynomial_evaluations(
                 &current_evals,
@@ -765,6 +817,8 @@ impl FriProver {
             let layer = FriLayer::new(current_evals.clone(), current_domain.clone());
             transcript.absorb(&format!("layer_{}", round + 1).as_bytes(), layer.merkle_tree.root());
             layers.push(layer);
+
+            round += 1;
         }
 
         let final_value = current_evals[0];
@@ -775,3 +829,234 @@ impl FriProver {
 }
 
 // ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transcript() {
+        let mut t = Transcript::new(b"test");
+        t.absorb(b"data1", b"value1");
+        let c1 = t.challenge_scalar(b"challenge");
+        assert!(c1 != Scalar::ZERO);
+    }
+
+    #[test]
+    fn test_domain_generation() {
+        let domain = generate_evaluation_domain(8, Scalar::from(2));
+        assert_eq!(domain.len(), 8);
+        assert!(domain[0] != Scalar::ZERO);
+    }
+
+    #[test]
+    fn test_root_of_unity_orders() {
+        // Test that roots have correct orders
+        for k in 1..=10 {
+            let root = primitive_root_of_unity_pow2(k).unwrap();
+
+            // Check that root^(2^k) == 1
+            let order = 1u64 << k;
+            let result = root.pow_vartime(&[order, 0, 0, 0]);
+            assert_eq!(result, Scalar::ONE, "Root of unity order check failed for k={}", k);
+
+            // Check strictness: root^(2^(k-1)) != 1 (i.e., it's primitive)
+            if k > 0 {
+                let half_order = 1u64 << (k - 1);
+                let half_result = root.pow_vartime(&[half_order, 0, 0, 0]);
+                assert_ne!(half_result, Scalar::ONE,
+                           "Root should be primitive (order exactly 2^{}) for k={}", k, k);
+            }
+        }
+
+        // Test that we respect 2-adicity limit
+        let two_adicity = Scalar::S as usize;
+        assert!(primitive_root_of_unity_pow2(two_adicity).is_some());
+        assert!(primitive_root_of_unity_pow2(two_adicity + 1).is_none());
+    }
+
+    #[test]
+    fn test_domain_coset_not_in_subgroup() {
+        // Test with offset = 1 (should be bumped to 11)
+        let domain = generate_evaluation_domain(8, Scalar::ONE);
+        assert_eq!(domain.len(), 8);
+
+        // Verify first element is NOT 1 (since we bumped the offset)
+        assert_ne!(domain[0], Scalar::ONE);
+
+        // Verify the offset is not in the subgroup
+        let offset = domain[0];
+        let offset_8th = offset.pow_vartime(&[8, 0, 0, 0]);
+        assert_ne!(offset_8th, Scalar::ONE, "Coset offset should not be in subgroup");
+
+        // Test with a non-trivial offset that's already good
+        let good_offset = Scalar::from(7);
+        let domain2 = generate_evaluation_domain(16, good_offset);
+        assert_eq!(domain2[0], good_offset);
+
+        let offset_16th = good_offset.pow_vartime(&[16, 0, 0, 0]);
+        assert_ne!(offset_16th, Scalar::ONE, "Good offset should not be in subgroup");
+    }
+
+    #[test]
+    fn test_pairing_invariant_neg_one() {
+        // Test that for a properly constructed domain, ω^(n/2) = -1
+        for k in 2..=8 {
+            let n = 1usize << k;
+            let domain = generate_evaluation_domain(n, Scalar::from(3));
+
+            // Extract omega from consecutive domain elements
+            let omega = domain[1] * domain[0].invert().unwrap();
+
+            // Check ω^(n/2) = -1
+            let half = n / 2;
+            let omega_half = omega.pow_vartime(&[half as u64, 0, 0, 0]);
+
+            assert_eq!(omega_half, -Scalar::ONE,
+                       "Pairing invariant failed for domain size {}: ω^({}) should equal -1", n, half);
+        }
+    }
+
+    #[test]
+    fn test_rounds_stop_rule() {
+        // Test that FRI stops when current_evals.len() <= degree_bound + 1
+        let generator = G1Projective::generator();
+        let prover = FriProver::new(generator);
+
+        // Create initial evaluations
+        let domain_size = 64;
+        let degree_bound = 7; // Should stop when we reach 8 or fewer elements
+
+        let domain = generate_evaluation_domain(domain_size, Scalar::from(5));
+        let evals: Vec<G1Projective> = (0..domain_size)
+            .map(|i| generator * Scalar::from(i as u64))
+            .collect();
+
+        let mut transcript = Transcript::new(b"TEST_STOP_RULE");
+        let commitment = prover.commit(&evals, domain, degree_bound, &mut transcript);
+
+        // Final layer should have at most degree_bound + 1 elements
+        let final_layer = &commitment.layers.last().unwrap();
+        assert!(final_layer.evaluations.len() <= degree_bound + 1,
+                "Final layer has {} elements, expected at most {}",
+                final_layer.evaluations.len(), degree_bound + 1);
+
+        // Verify that we actually folded (should have multiple layers)
+        assert!(commitment.layers.len() > 1,
+                "Should have multiple layers after folding");
+
+        println!("FRI stop rule test:");
+        println!("  Initial domain: {} elements", domain_size);
+        println!("  Degree bound: {}", degree_bound);
+        println!("  Total layers: {}", commitment.layers.len());
+        println!("  Final layer size: {}", final_layer.evaluations.len());
+    }
+
+    #[test]
+    fn test_barycentric_weights_computation() {
+        let domain = generate_evaluation_domain(4, Scalar::from(7));
+        let weights = barycentric_weights(&domain);
+
+        assert_eq!(weights.len(), 4);
+
+        // All weights should be non-zero
+        for w in &weights {
+            assert!(*w != Scalar::ZERO);
+        }
+    }
+
+    #[test]
+    fn test_linear_encoding_evaluation() {
+        // Test linear encoding: f(x)·G interpolation
+        let generator = G1Projective::generator();
+        let domain = generate_evaluation_domain(4, Scalar::from(11));
+
+        // Create some encoded evaluations f(x_i)·G
+        let base_vals: Vec<G1Projective> = vec![
+            generator * Scalar::from(1),
+            generator * Scalar::from(2),
+            generator * Scalar::from(3),
+            generator * Scalar::from(4),
+        ];
+
+        let weights = barycentric_weights(&domain);
+
+        // Evaluate at a point in the domain - should match exactly
+        let result = eval_linear_encoding_barycentric(&domain, &base_vals, &weights, domain[0]);
+        assert_eq!(result, base_vals[0], "Evaluation at domain point should match");
+
+        // Evaluate at a different point
+        let z = Scalar::from(13);
+        let result = eval_linear_encoding_barycentric(&domain, &base_vals, &weights, z);
+
+        // Result should be a valid group element
+        assert!(result != G1Projective::identity() || z == Scalar::ZERO);
+    }
+
+    #[test]
+    fn test_indicator_commitment_with_length_prefix() {
+        let generator = G1Projective::generator();
+        let proof_gen = ProofGenerator::new(generator);
+
+        let b_values = vec![Scalar::ONE, Scalar::ZERO, Scalar::ONE, Scalar::ZERO];
+        let n = 4;
+
+        let commitment = proof_gen.commit_to_indicator(&b_values, n);
+
+        // Should produce a 32-byte hash
+        assert_eq!(commitment.len(), 32);
+
+        // Different n should produce different commitment
+        let commitment2 = proof_gen.commit_to_indicator(&b_values, 5);
+        assert_ne!(commitment, commitment2);
+
+        // Different values should produce different commitment
+        let b_values2 = vec![Scalar::ZERO, Scalar::ONE, Scalar::ONE, Scalar::ZERO];
+        let commitment3 = proof_gen.commit_to_indicator(&b_values2, n);
+        assert_ne!(commitment, commitment3);
+    }
+
+    #[test]
+    fn test_folding_reduces_domain() {
+        let generator = G1Projective::generator();
+        let domain = generate_evaluation_domain(16, Scalar::from(7));
+        let evals: Vec<G1Projective> = (0..16)
+            .map(|i| generator * Scalar::from(i as u64))
+            .collect();
+
+        let beta = Scalar::from(42);
+        let (folded_evals, folded_domain) = fold_polynomial_evaluations(&evals, &domain, beta);
+
+        assert_eq!(folded_evals.len(), 8);
+        assert_eq!(folded_domain.len(), 8);
+
+        // Folded domain should be squares of first half
+        for i in 0..8 {
+            assert_eq!(folded_domain[i], domain[i].square());
+        }
+    }
+
+    #[test]
+    fn test_merkle_tree_verification() {
+        let generator = G1Projective::generator();
+        let evals: Vec<G1Projective> = (0..8)
+            .map(|i| generator * Scalar::from(i as u64))
+            .collect();
+
+        let tree = MerkleTree::build_from_group_elements(&evals);
+
+        for i in 0..8 {
+            let path = tree.get_authentication_path(i);
+            let leaf_data = evals[i].to_affine().to_compressed();
+
+            assert!(MerkleTree::verify_authentication_path(
+                tree.root(),
+                &leaf_data,
+                i,
+                &path
+            ), "Merkle proof verification failed for index {}", i);
+        }
+    }
+}
