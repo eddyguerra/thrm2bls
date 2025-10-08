@@ -1,4 +1,10 @@
 // fri.rs - Sound FRI protocol with all critical fixes
+//
+// This implementation uses linear elliptic-curve encoding (f(x)·G) rather than
+// multiplicative encoding. All polynomial operations, interpolation, and FRI folding
+// operate linearly in the elliptic curve group. This means we work with commitments
+// of the form f(x)·G where G is the generator and f is a polynomial.
+
 use bls12_381::{G1Projective, Scalar};
 use ff::{Field, PrimeField};
 use group::Curve;
@@ -8,6 +14,11 @@ use crate::polynomial::{Polynomial, EncapsulatedPolynomial, LagrangeInterpolatio
 
 // Security parameter: number of queries for soundness
 const DEFAULT_NUM_QUERIES: usize = 10;
+
+// Helper for BLS12-381 2-adicity (portability and clarity)
+fn two_adicity() -> usize {
+    Scalar::S as usize
+}
 
 // ============================================================================
 // FRI QUERIES AND DECOMMITMENT
@@ -101,6 +112,14 @@ impl FriVerifier {
         decommitment: &FriDecommitment,
         transcript: &mut Transcript,
     ) -> bool {
+        // Absorb parameters for transcript parity with prover
+        let extended_size = commitment.layers[0].domain.len();
+        transcript.absorb(b"PARAMS_V1", &(extended_size as u64).to_le_bytes());
+        transcript.absorb(b"PARAMS_V1", &(commitment.degree_bound as u64).to_le_bytes());
+        transcript.absorb(b"PARAMS_V1", &(commitment.blowup_factor as u64).to_le_bytes());
+        transcript.absorb(b"PARAMS_V1", &commitment.base_offset.to_bytes());
+        transcript.absorb(b"PARAMS_V1", &commitment.extended_offset.to_bytes());
+
         // Recompute transcript to get challenges
         let mut betas = Vec::new();
         for i in 0..commitment.layers.len() - 1 {
@@ -110,9 +129,21 @@ impl FriVerifier {
         }
         transcript.absorb(b"final_value", &commitment.final_value.to_affine().to_compressed());
 
+        // Re-derive query indices and verify they match
+        let num_queries = decommitment.query_indices.len();
+        for i in 0..num_queries {
+            let expected_index = transcript.challenge_usize(
+                &format!("query_{}", i).as_bytes(),
+                commitment.layers[0].evaluations.len(),
+            );
+            if expected_index != decommitment.query_indices[i] {
+                return false; // Query indices don't match transcript
+            }
+        }
+
         // Verify each query
-        for layer_queries in &decommitment.queries {
-            if !self.verify_single_query(commitment, layer_queries, &betas) {
+        for (query_idx, layer_queries) in decommitment.queries.iter().enumerate() {
+            if !self.verify_single_query(commitment, layer_queries, &betas, query_idx) {
                 return false;
             }
         }
@@ -125,6 +156,7 @@ impl FriVerifier {
         commitment: &FriCommitment,
         layer_queries: &[FriQuery],
         betas: &[Scalar],
+        _query_idx: usize,
     ) -> bool {
         for (i, query) in layer_queries.iter().enumerate() {
             let layer = &commitment.layers[query.layer_index];
@@ -166,6 +198,14 @@ impl FriVerifier {
                 if expected != layer_queries[i + 1].evaluation {
                     return false;
                 }
+            }
+        }
+
+        // Verify final evaluation matches commitment
+        if let Some(last_query) = layer_queries.last() {
+            let final_layer = &commitment.layers.last().unwrap();
+            if final_layer.evaluations[last_query.evaluation_index] != commitment.final_value {
+                return false; // Final evaluation doesn't match
             }
         }
 
@@ -211,7 +251,7 @@ impl ProofGenerator {
         signing_set: &[usize],
         n: usize,
         public_keys: &[G1Projective],
-        weights: &[Scalar],
+        weights: &[Scalar], // Reserved for weighted aggregation
     ) -> AggregationProof {
         self.generate_aggregation_proof_with_queries(
             signing_set,
@@ -227,7 +267,7 @@ impl ProofGenerator {
         signing_set: &[usize],
         n: usize,
         public_keys: &[G1Projective],
-        weights: &[Scalar],
+        _weights: &[Scalar], // Reserved for weighted aggregation
         num_queries: usize,
     ) -> AggregationProof {
         println!("\n🔐 Generating FRI-based aggregation proof...");
@@ -258,6 +298,7 @@ impl ProofGenerator {
         let extended_domain = generate_evaluation_domain(extended_size, extended_offset);
 
         // Perform proper LDE: interpolate in linear encoding
+        // Complexity note: O(n·blowup) is acceptable for correctness-oriented demo
         println!("  Step 4: Interpolating {} → {} points", base_size, extended_size);
         let mut extended_evals = Vec::with_capacity(extended_size);
 
@@ -291,6 +332,9 @@ impl ProofGenerator {
             &extended_evals,
             extended_domain,
             degree_bound,
+            base_offset,
+            extended_offset,
+            blowup_factor,
             &mut transcript
         );
 
@@ -400,11 +444,14 @@ impl ProofGenerator {
 // FIAT-SHAMIR TRANSCRIPT
 // ============================================================================
 
+/// Fiat-Shamir transcript for non-interactive soundness.
+/// Models a random oracle by absorbing protocol messages and producing challenges.
 pub struct Transcript {
     hasher: Sha256,
 }
 
 impl Transcript {
+    /// Create a new transcript with domain separation label
     pub fn new(label: &[u8]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(b"TRANSCRIPT_V1");
@@ -412,12 +459,14 @@ impl Transcript {
         Self { hasher }
     }
 
+    /// Absorb a tagged message into the transcript
     pub fn absorb(&mut self, tag: &[u8], bytes: &[u8]) {
         self.hasher.update(tag);
         self.hasher.update(&(bytes.len() as u64).to_le_bytes());
         self.hasher.update(bytes);
     }
 
+    /// Generate a scalar challenge from the current transcript state
     pub fn challenge_scalar(&mut self, tag: &[u8]) -> Scalar {
         self.hasher.update(tag);
         let h = self.hasher.clone().finalize();
@@ -427,6 +476,7 @@ impl Transcript {
         Scalar::from_bytes_wide(&w)
     }
 
+    /// Generate a bounded integer challenge from the current transcript state
     pub fn challenge_usize(&mut self, tag: &[u8], modulo: usize) -> usize {
         self.hasher.update(tag);
         let h = self.hasher.clone().finalize();
@@ -446,7 +496,7 @@ impl Transcript {
 /// Derives the root by taking ROOT_OF_UNITY (a 2^S root) and raising it
 /// to the power 2^(S-k) to obtain a primitive 2^k root.
 pub fn primitive_root_of_unity_pow2(k: usize) -> Option<Scalar> {
-    let two_adicity = Scalar::S as usize;
+    let two_adicity = two_adicity();
 
     if k > two_adicity {
         return None;
@@ -472,7 +522,7 @@ pub fn generate_evaluation_domain(domain_size: usize, mut coset_offset: Scalar) 
     assert!(domain_size.is_power_of_two(), "Domain size must be power of 2");
 
     let k = domain_size.trailing_zeros() as usize;
-    let two_adicity = Scalar::S as usize;
+    let two_adicity = two_adicity();
     assert!(k <= two_adicity, "Domain too large for 2-adicity");
 
     let omega = primitive_root_of_unity_pow2(k).expect("No root of unity for size");
@@ -517,6 +567,8 @@ fn generate_evaluation_domain_unchecked(domain_size: usize, omega: Scalar, coset
 /// Precompute barycentric weights for domain X = {x_j}.
 ///
 /// w_j = 1 / ∏_{m≠j} (x_j - x_m)
+///
+/// Complexity: O(n²) preprocessing, but enables O(n) evaluation per point.
 fn barycentric_weights(xs: &[Scalar]) -> Vec<Scalar> {
     let n = xs.len();
     let mut w = vec![Scalar::ONE; n];
@@ -539,6 +591,9 @@ fn barycentric_weights(xs: &[Scalar]) -> Vec<Scalar> {
 /// Linear encoding interpretation: each base_vals[j] represents f(x_j)·G,
 /// where G is the elliptic curve generator and f is a polynomial.
 ///
+/// Handles the special case where z is in the interpolation domain to avoid
+/// division by zero.
+///
 /// Using barycentric weights:
 /// - λ_j(z) = w_j / (z - x_j)
 /// - Λ(z) = Σ λ_j(z)
@@ -552,6 +607,14 @@ fn eval_linear_encoding_barycentric(
     z: Scalar,
 ) -> G1Projective {
     let n = base_points.len();
+
+    // Handle evaluation at interpolation points directly
+    for j in 0..n {
+        if z == base_points[j] {
+            return base_vals[j];
+        }
+    }
+
     let mut lam = vec![Scalar::ZERO; n];
     let mut denom = Scalar::ZERO;
 
@@ -703,11 +766,13 @@ pub struct FriLayer {
 impl FriLayer {
     pub fn new(evaluations: Vec<G1Projective>, domain: Vec<Scalar>) -> Self {
         assert_eq!(evaluations.len(), domain.len());
+        assert!(domain.len().is_power_of_two(), "Domain size must be power of two");
 
         // Domain pairing invariant: ω^(n/2) = -1 for proper folding
+        // The coset ratio omega = domain[1] * domain[0]^{-1} is the step between consecutive elements
         if domain.len() >= 2 {
             let half = domain.len() / 2;
-            let omega = domain[1] * domain[0].invert().unwrap();
+            let omega = domain[1] * domain[0].invert().unwrap(); // Coset ratio
             let omega_half = omega.pow_vartime(&[half as u64, 0, 0, 0]);
             debug_assert_eq!(omega_half, -Scalar::ONE,
                              "Domain pairing invariant violated: ω^(n/2) must equal -1");
@@ -767,6 +832,10 @@ pub fn fold_polynomial_evaluations(
 pub struct FriCommitment {
     pub layers: Vec<FriLayer>,
     pub final_value: G1Projective,
+    pub degree_bound: usize,        // Added: degree bound for verification
+    pub base_offset: Scalar,        // Added: base domain offset
+    pub extended_offset: Scalar,    // Added: extended domain offset
+    pub blowup_factor: usize,       // Added: blowup factor
 }
 
 pub struct FriProver {
@@ -787,6 +856,9 @@ impl FriProver {
         initial_evaluations: &[G1Projective],
         initial_domain: Vec<Scalar>,
         degree_bound: usize,
+        base_offset: Scalar,        // Added parameter
+        extended_offset: Scalar,    // Added parameter
+        blowup_factor: usize,       // Added parameter
         transcript: &mut Transcript,
     ) -> FriCommitment {
         assert!(initial_evaluations.len().is_power_of_two());
@@ -821,10 +893,22 @@ impl FriProver {
             round += 1;
         }
 
+        // Assert degree bound is satisfied
+        assert!(current_evals.len() <= degree_bound + 1,
+                "Final layer size {} exceeds degree bound + 1 = {}",
+                current_evals.len(), degree_bound + 1);
+
         let final_value = current_evals[0];
         transcript.absorb(b"final_value", &final_value.to_affine().to_compressed());
 
-        FriCommitment { layers, final_value }
+        FriCommitment {
+            layers,
+            final_value,
+            degree_bound,           // Store degree bound
+            base_offset,            // Store base offset
+            extended_offset,        // Store extended offset
+            blowup_factor,          // Store blowup factor
+        }
     }
 }
 
@@ -872,7 +956,7 @@ mod tests {
         }
 
         // Test that we respect 2-adicity limit
-        let two_adicity = Scalar::S as usize;
+        let two_adicity = two_adicity();
         assert!(primitive_root_of_unity_pow2(two_adicity).is_some());
         assert!(primitive_root_of_unity_pow2(two_adicity + 1).is_none());
     }
@@ -935,7 +1019,15 @@ mod tests {
             .collect();
 
         let mut transcript = Transcript::new(b"TEST_STOP_RULE");
-        let commitment = prover.commit(&evals, domain, degree_bound, &mut transcript);
+        let commitment = prover.commit(
+            &evals,
+            domain,
+            degree_bound,
+            Scalar::from(5),    // base_offset
+            Scalar::from(7),    // extended_offset
+            4,                  // blowup_factor
+            &mut transcript
+        );
 
         // Final layer should have at most degree_bound + 1 elements
         let final_layer = &commitment.layers.last().unwrap();
@@ -946,6 +1038,12 @@ mod tests {
         // Verify that we actually folded (should have multiple layers)
         assert!(commitment.layers.len() > 1,
                 "Should have multiple layers after folding");
+
+        // Verify stored parameters
+        assert_eq!(commitment.degree_bound, degree_bound);
+        assert_eq!(commitment.base_offset, Scalar::from(5));
+        assert_eq!(commitment.extended_offset, Scalar::from(7));
+        assert_eq!(commitment.blowup_factor, 4);
 
         println!("FRI stop rule test:");
         println!("  Initial domain: {} elements", domain_size);
@@ -993,6 +1091,29 @@ mod tests {
 
         // Result should be a valid group element
         assert!(result != G1Projective::identity() || z == Scalar::ZERO);
+    }
+
+    #[test]
+    fn test_barycentric_domain_point_handling() {
+        // Test that evaluation at domain points returns exact value without division
+        let generator = G1Projective::generator();
+        let domain = generate_evaluation_domain(4, Scalar::from(3));
+
+        let base_vals: Vec<G1Projective> = vec![
+            generator * Scalar::from(10),
+            generator * Scalar::from(20),
+            generator * Scalar::from(30),
+            generator * Scalar::from(40),
+        ];
+
+        let weights = barycentric_weights(&domain);
+
+        // Test each domain point
+        for i in 0..4 {
+            let result = eval_linear_encoding_barycentric(&domain, &base_vals, &weights, domain[i]);
+            assert_eq!(result, base_vals[i],
+                       "Direct evaluation at domain[{}] should return base_vals[{}]", i, i);
+        }
     }
 
     #[test]
@@ -1058,5 +1179,38 @@ mod tests {
                 &path
             ), "Merkle proof verification failed for index {}", i);
         }
+    }
+
+    #[test]
+    fn test_verifier_transcript_parity() {
+        // Test that verifier rebuilds transcript correctly
+        let generator = G1Projective::generator();
+        let prover = FriProver::new(generator);
+        let verifier = FriVerifier::new(generator);
+
+        // Create a simple commitment
+        let domain = generate_evaluation_domain(16, Scalar::from(3));
+        let evals: Vec<G1Projective> = (0..16)
+            .map(|i| generator * Scalar::from(i as u64))
+            .collect();
+
+        let mut prover_transcript = Transcript::new(b"TEST");
+        let commitment = prover.commit(
+            &evals,
+            domain,
+            7,                  // degree_bound
+            Scalar::from(3),    // base_offset
+            Scalar::from(5),    // extended_offset
+            2,                  // blowup_factor
+            &mut prover_transcript
+        );
+
+        let decommitment = prover.generate_queries(&commitment, 3, &mut prover_transcript);
+
+        // Verify with fresh transcript
+        let mut verifier_transcript = Transcript::new(b"TEST");
+        let valid = verifier.verify(&commitment, &decommitment, &mut verifier_transcript);
+
+        assert!(valid, "Verifier should accept valid proof");
     }
 }
