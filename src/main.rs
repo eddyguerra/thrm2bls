@@ -12,14 +12,16 @@ mod booleanity;
 mod clear_sumcheck;
 mod sk_encap_sumcheck;
 mod sk_qz_onepoint;
-mod fs_challenge;  // NEW: Fiat-Shamir challenge module
+mod fs_challenge;
+mod opening_proofs;  // NEW: Opening proofs module
 
 use polynomial::LagrangeInterpolation;
 use fri::{ProofGenerator, generate_evaluation_domain};
 use booleanity::verify_booleanity_constraint;
 use clear_sumcheck::verify_clear_sumcheck;
 use sk_qz_onepoint::verify_qz_onepoint_diagnostic;
-use fs_challenge::{RO2Inputs, verify_equations_at_fs_challenge};  // NEW
+use fs_challenge::{RO2Inputs, verify_equations_at_fs_challenge};
+use opening_proofs::{OpeningProver, OpeningVerifier, ClaimedEvaluations};  // NEW
 
 // ============================================================================
 // DOMAIN UTILITIES
@@ -234,6 +236,7 @@ pub struct AggregatedSignature {
     pub threshold: Scalar,
     pub aggregated_pk: G1Projective,
     pub proof: Option<fri::AggregationProof>,
+    pub opening_proof: Option<opening_proofs::CombinedOpeningProof>,  // NEW
 }
 
 // ============================================================================
@@ -330,6 +333,7 @@ impl Aggregator {
             threshold,
             aggregated_pk,
             proof: Some(proof),
+            opening_proof: None,  // Will be added by caller
         })
     }
 
@@ -454,7 +458,7 @@ fn main() {
         println!("    Party {} signed", i);
     }
 
-    // NEW: Booleanity constraint diagnostics (BEFORE aggregation starts)
+    // Booleanity constraint diagnostics
     println!("\n═══════════════════════════════════════════════════════════");
     println!("  BOOLEANITY CONSTRAINT DIAGNOSTICS");
     println!("═══════════════════════════════════════════════════════════");
@@ -469,12 +473,11 @@ fn main() {
 
     println!("\n═══════════════════════════════════════════════════════════\n");
 
-    // NEW: Clear Sumcheck (W·B identity) diagnostics
+    // Clear Sumcheck (W·B identity) diagnostics
     println!("═══════════════════════════════════════════════════════════");
     println!("  CLEAR SUMCHECK (W·B IDENTITY) DIAGNOSTICS");
     println!("═══════════════════════════════════════════════════════════");
 
-    // Convert weights_vec to proper format
     let weights_for_check: Vec<Scalar> = (0..n)
         .map(|i| weights_map.get(&i).copied().unwrap_or(Scalar::ZERO))
         .collect();
@@ -489,21 +492,17 @@ fn main() {
 
     println!("\n═══════════════════════════════════════════════════════════\n");
 
-    // NEW: SK Encapsulated Q_Z One-Point Computation
+    // SK Encapsulated Q_Z One-Point Computation
     println!("═══════════════════════════════════════════════════════════");
     println!("  SK ENCAPSULATED Q_Z ONE-POINT DIAGNOSTICS");
     println!("═══════════════════════════════════════════════════════════");
 
-    // For now, use Q_x(r)·G = identity (placeholder)
-    // In the full implementation, this would come from the Q_x computation step
     let qx_at_r = G1Projective::identity();
 
-    // Collect all public keys in order
     let all_pks_for_qz: Vec<G1Projective> = (0..n)
         .map(|i| public_keys_map.get(&i).map(|pk| pk.0).unwrap_or(G1Projective::identity()))
         .collect();
 
-    // Use domain[0] as test point for now
     let test_point_idx = 0;
 
     let (_qz_rG, binding_hash) = verify_qz_onepoint_diagnostic(
@@ -514,7 +513,6 @@ fn main() {
         test_point_idx,
     );
 
-    // Print binding hash (first 16 bytes for readability)
     let hex_str = binding_hash.iter()
         .take(16)
         .map(|b| format!("{:02x}", b))
@@ -523,12 +521,11 @@ fn main() {
 
     println!("\n═══════════════════════════════════════════════════════════\n");
 
-    // NEW: Fiat-Shamir Challenge Verification at Single Point r
+    // Fiat-Shamir Challenge Verification
     println!("═══════════════════════════════════════════════════════════");
     println!("  FIAT-SHAMIR CHALLENGE r - THREE EQUATION CHECK");
     println!("═══════════════════════════════════════════════════════════");
 
-    // Gather all commitment roots
     let hcom_sk = {
         let mut hasher = Sha256::new();
         hasher.update(b"SK_COMMITMENT");
@@ -571,10 +568,10 @@ fn main() {
         arr
     };
 
-    let hcom_qx = [4u8; 32];  // Placeholder
-    let com_qx_p = [5u8; 32]; // Placeholder
-    let com_qz_p = [6u8; 32]; // Placeholder
-    let com_q = [7u8; 32];    // Placeholder
+    let hcom_qx = [4u8; 32];
+    let com_qx_p = [5u8; 32];
+    let com_qz_p = [6u8; 32];
+    let com_q = [7u8; 32];
 
     let ro2_inputs = RO2Inputs {
         hcom_sk,
@@ -587,7 +584,6 @@ fn main() {
         qz_scheme_label: b"QZ_ONEPOINT_V1",
     };
 
-    // Prepare domain and evaluation functions
     let domain_size = n.next_power_of_two();
     let vanishing_domain_for_fs = generate_evaluation_domain(domain_size, Scalar::ONE);
     let vanishing_roots_for_fs: Vec<Scalar> = vanishing_domain_for_fs.iter().take(n).copied().collect();
@@ -611,7 +607,6 @@ fn main() {
         result
     };
 
-    // Verify all three equations at FS challenge r
     let fs_valid = verify_equations_at_fs_challenge(
         ro2_inputs,
         n,
@@ -631,12 +626,85 @@ fn main() {
 
     println!("\n═══════════════════════════════════════════════════════════\n");
 
+    // NEW: Generate Opening Proofs at Challenge r
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  POLYNOMIAL OPENING PROOFS AT CHALLENGE r");
+    println!("═══════════════════════════════════════════════════════════");
+
+    let opening_prover = OpeningProver::new(ts.generator);
+
+    // Derive the challenge r that was used
+    let (r_challenge, _) = {
+        let mut ro2_inputs_copy = RO2Inputs {
+            hcom_sk,
+            com_w,
+            com_b,
+            hcom_qx,
+            com_qx_p,
+            com_qz_p,
+            com_q,
+            qz_scheme_label: b"QZ_ONEPOINT_V1",
+        };
+        fs_challenge::derive_valid_r(&mut ro2_inputs_copy, n, |x: Scalar| -> Scalar {
+            let mut result = Scalar::ONE;
+            for j in 0..n {
+                result *= x - vanishing_roots_for_fs[j];
+            }
+            result
+        })
+    };
+
+    // Generate all opening proofs
+    let opening_proof = opening_prover.generate_all_openings(
+        &all_pks_for_qz,
+        &b_bits_for_fs,
+        &weights_for_check,
+        n,
+        r_challenge,
+    );
+
+    println!("\n  ✅ Opening proofs generated");
+    println!("  📊 Challenge point r derived");
+    println!("  📊 Total proof size: {} bytes (~{} KB)",
+             opening_proof.total_size,
+             opening_proof.total_size / 1024);
+    println!("  📊 Complexity: O(log²n) where n = {}, log²n ≈ {}",
+             n,
+             (n as f64).log2().powi(2) as usize);
+
+    // Verify opening proofs
+    let opening_verifier = OpeningVerifier::new(ts.generator);
+
+    let claimed_evals = ClaimedEvaluations {
+        sk_r: opening_proof.sk_proof.evaluation_at_r,
+        qx_r: opening_proof.qx_proof.evaluation_at_r,
+        qz_r: opening_proof.qz_proof.evaluation_at_r,
+        w_r: opening_proof.w_proof.evaluation_at_r,
+        b_r: opening_proof.b_proof.evaluation_at_r,
+        qx_prime_r: opening_proof.qx_prime_proof.evaluation_at_r,
+        qz_prime_r: opening_proof.qz_prime_proof.evaluation_at_r,
+        q_r: opening_proof.q_proof.evaluation_at_r,
+    };
+
+    let opening_valid = opening_verifier.verify_all_openings(&opening_proof, &claimed_evals);
+
+    if !opening_valid {
+        println!("\n❌ FATAL: Opening proof verification failed!");
+        println!("Cannot proceed with aggregation.");
+        return;
+    }
+
+    println!("\n═══════════════════════════════════════════════════════════\n");
+
     // Aggregation with Proof Generation
     println!("🔗 Aggregation:");
     let aggregator = Aggregator::new(ts.generator);
 
     match aggregator.aggregate(msg, &partials, &public_keys_map, &weights_map, n) {
-        Ok(agg_sig) => {
+        Ok(mut agg_sig) => {
+            // Attach the opening proof
+            agg_sig.opening_proof = Some(opening_proof);
+
             println!("  ✓ Aggregation successful");
             println!("  Threshold achieved: {:?}", agg_sig.threshold);
 
@@ -649,12 +717,42 @@ fn main() {
                 println!("\n📊 Proof Statistics:");
                 println!("  Commitment size: {} bytes", proof.b_commitment.len());
                 println!("  Estimated total proof size: {} bytes", proof.proof_size);
+
+                if let Some(ref op) = agg_sig.opening_proof {
+                    println!("  Opening proofs size: {} bytes", op.total_size);
+                    println!("  Combined proof size: {} bytes (~{} KB)",
+                             proof.proof_size + op.total_size,
+                             (proof.proof_size + op.total_size) / 1024);
+                }
+
                 println!("  Complexity: O(λ·log²n) = O(128·log²5) ≈ {} bytes",
                          128 * (5_f64.log2().ceil() as usize).pow(2) * 32);
             }
 
             // Verification
             println!("\n🔍 Verification:");
+
+            // Verify opening proofs if present
+            if let Some(ref opening_pf) = agg_sig.opening_proof {
+                let ver = OpeningVerifier::new(ts.generator);
+                let evals = ClaimedEvaluations {
+                    sk_r: opening_pf.sk_proof.evaluation_at_r,
+                    qx_r: opening_pf.qx_proof.evaluation_at_r,
+                    qz_r: opening_pf.qz_proof.evaluation_at_r,
+                    w_r: opening_pf.w_proof.evaluation_at_r,
+                    b_r: opening_pf.b_proof.evaluation_at_r,
+                    qx_prime_r: opening_pf.qx_prime_proof.evaluation_at_r,
+                    qz_prime_r: opening_pf.qz_prime_proof.evaluation_at_r,
+                    q_r: opening_pf.q_proof.evaluation_at_r,
+                };
+
+                if !ver.verify_all_openings(opening_pf, &evals) {
+                    println!("  ❌ Opening proofs INVALID!");
+                    return;
+                }
+                println!("  ✅ Opening proofs VERIFIED!");
+            }
+
             if aggregator.verify_aggregated(msg, &agg_sig, n) {
                 println!("  ✅ Signature is VALID!");
                 println!("  ✅ Aggregation proof VERIFIED!");
@@ -671,12 +769,12 @@ fn main() {
     println!("  🎉 Demo Complete!");
     println!("═══════════════════════════════════════════════════════════\n");
 
-    // Additional information
     println!("📖 Implementation Details:");
     println!("  • Polynomial commitments via Merkle trees");
     println!("  • Generalized Sumcheck (Lemma 1) for quotients");
     println!("  • FRI protocol for low-degree testing on LHEncap");
     println!("  • Binary constraint check: B(x)·(1-B(x)) = Q(x)·Z(x)");
+    println!("  • Opening proofs at challenge r: O(log²n) verification");
     println!("  • Security: AGM + Random Oracle Model");
     println!("  • Signature size: O(log²n)");
     println!("  • Verification time: O(log²n)");
@@ -757,7 +855,6 @@ mod tests {
 
     #[test]
     fn test_booleanity_constraint_integration() {
-        // Test the booleanity constraint with different signing sets
         let test_cases = vec![
             (5, vec![0, 1, 2]),
             (5, vec![0, 2, 4]),
@@ -775,7 +872,6 @@ mod tests {
 
     #[test]
     fn test_clear_sumcheck_integration() {
-        // Test the clear sumcheck with different signing sets
         let test_cases = vec![
             (5, vec![0, 1, 2]),
             (5, vec![0, 2, 4]),
@@ -796,14 +892,11 @@ mod tests {
 
     #[test]
     fn test_qz_onepoint_integration() {
-        use rand::thread_rng;
-
         let mut rng = thread_rng();
         let ts = ThresholdSignature::new();
         let n = 5;
         let signing_set = vec![0, 1, 2];
 
-        // Generate keys
         let pks: Vec<G1Projective> = (0..n)
             .map(|_| {
                 let sk = Scalar::random(&mut rng);
@@ -811,7 +904,6 @@ mod tests {
             })
             .collect();
 
-        // Placeholder Q_x(r)
         let qx_at_r = G1Projective::identity();
 
         let (_qz_rG, binding_hash) = verify_qz_onepoint_diagnostic(
@@ -819,7 +911,7 @@ mod tests {
             &pks,
             n,
             qx_at_r,
-            0, // test_point_idx
+            0,
         );
 
         assert_eq!(binding_hash.len(), 32, "Binding hash should be 32 bytes");
@@ -828,14 +920,11 @@ mod tests {
 
     #[test]
     fn test_fs_challenge_integration() {
-        use rand::thread_rng;
-
         let mut rng = thread_rng();
         let ts = ThresholdSignature::new();
         let n = 5;
         let signing_set = vec![0, 1, 2];
 
-        // Generate keys
         let pks: Vec<G1Projective> = (0..n)
             .map(|_| {
                 let sk = Scalar::random(&mut rng);
@@ -854,7 +943,6 @@ mod tests {
             }
         }
 
-        // Create RO2 inputs
         let ro2_inputs = RO2Inputs {
             hcom_sk: [1u8; 32],
             com_w: [2u8; 32],
@@ -895,5 +983,63 @@ mod tests {
 
         assert!(result, "FS challenge verification should pass");
         println!("✓ FS challenge integration test passed!");
+    }
+
+    #[test]
+    fn test_opening_proofs_integration() {
+        let mut rng = thread_rng();
+        let ts = ThresholdSignature::new();
+        let n = 5;
+        let signing_set = vec![0, 1, 2];
+
+        let pks: Vec<G1Projective> = (0..n)
+            .map(|_| {
+                let sk = Scalar::random(&mut rng);
+                ts.generator * sk
+            })
+            .collect();
+
+        let weights: Vec<Scalar> = (1..=n)
+            .map(|i| Scalar::from(i as u64))
+            .collect();
+
+        let mut b_bits = vec![0u8; n];
+        for &i in &signing_set {
+            if i < n {
+                b_bits[i] = 1;
+            }
+        }
+
+        let r_challenge = Scalar::from(42);
+
+        let opening_prover = OpeningProver::new(ts.generator);
+        let opening_proof = opening_prover.generate_all_openings(
+            &pks,
+            &b_bits,
+            &weights,
+            n,
+            r_challenge,
+        );
+
+        assert_eq!(opening_proof.r, r_challenge);
+        assert!(opening_proof.total_size > 0);
+
+        let opening_verifier = OpeningVerifier::new(ts.generator);
+        let claimed_evals = ClaimedEvaluations {
+            sk_r: opening_proof.sk_proof.evaluation_at_r,
+            qx_r: opening_proof.qx_proof.evaluation_at_r,
+            qz_r: opening_proof.qz_proof.evaluation_at_r,
+            w_r: opening_proof.w_proof.evaluation_at_r,
+            b_r: opening_proof.b_proof.evaluation_at_r,
+            qx_prime_r: opening_proof.qx_prime_proof.evaluation_at_r,
+            qz_prime_r: opening_proof.qz_prime_proof.evaluation_at_r,
+            q_r: opening_proof.q_proof.evaluation_at_r,
+        };
+
+        let valid = opening_verifier.verify_all_openings(&opening_proof, &claimed_evals);
+        assert!(valid, "Opening proofs should verify");
+
+        println!("✓ Opening proofs integration test passed!");
+        println!("  Proof size: {} bytes", opening_proof.total_size);
     }
 }

@@ -1,3 +1,4 @@
+
 // fri.rs - Sound FRI protocol with all critical fixes
 //
 // This implementation uses linear elliptic-curve encoding (f(x)·G) rather than
