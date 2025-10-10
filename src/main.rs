@@ -10,13 +10,16 @@ mod polynomial;
 mod fri;
 mod booleanity;
 mod clear_sumcheck;
-mod sk_qz_onepoint;  // NEW: Add Q_Z one-point module
+mod sk_encap_sumcheck;
+mod sk_qz_onepoint;
+mod fs_challenge;  // NEW: Fiat-Shamir challenge module
 
 use polynomial::LagrangeInterpolation;
-use fri::ProofGenerator;
+use fri::{ProofGenerator, generate_evaluation_domain};
 use booleanity::verify_booleanity_constraint;
 use clear_sumcheck::verify_clear_sumcheck;
-use sk_qz_onepoint::verify_qz_onepoint_diagnostic;  // NEW
+use sk_qz_onepoint::verify_qz_onepoint_diagnostic;
+use fs_challenge::{RO2Inputs, verify_equations_at_fs_challenge};  // NEW
 
 // ============================================================================
 // DOMAIN UTILITIES
@@ -520,6 +523,114 @@ fn main() {
 
     println!("\n═══════════════════════════════════════════════════════════\n");
 
+    // NEW: Fiat-Shamir Challenge Verification at Single Point r
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  FIAT-SHAMIR CHALLENGE r - THREE EQUATION CHECK");
+    println!("═══════════════════════════════════════════════════════════");
+
+    // Gather all commitment roots
+    let hcom_sk = {
+        let mut hasher = Sha256::new();
+        hasher.update(b"SK_COMMITMENT");
+        for pk in &all_pks_for_qz {
+            hasher.update(&pk.to_affine().to_compressed());
+        }
+        let hash = hasher.finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&hash);
+        arr
+    };
+
+    let com_w = {
+        let mut hasher = Sha256::new();
+        hasher.update(b"W_COMMITMENT");
+        for w in &weights_for_check {
+            hasher.update(&w.to_bytes());
+        }
+        let hash = hasher.finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&hash);
+        arr
+    };
+
+    let com_b = {
+        let mut b_bits = vec![0u8; n];
+        for &i in &signing_set {
+            if i < n {
+                b_bits[i] = 1;
+            }
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"B_COMMITMENT");
+        for &bit in &b_bits {
+            hasher.update(&[bit]);
+        }
+        let hash = hasher.finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&hash);
+        arr
+    };
+
+    let hcom_qx = [4u8; 32];  // Placeholder
+    let com_qx_p = [5u8; 32]; // Placeholder
+    let com_qz_p = [6u8; 32]; // Placeholder
+    let com_q = [7u8; 32];    // Placeholder
+
+    let ro2_inputs = RO2Inputs {
+        hcom_sk,
+        com_w,
+        com_b,
+        hcom_qx,
+        com_qx_p,
+        com_qz_p,
+        com_q,
+        qz_scheme_label: b"QZ_ONEPOINT_V1",
+    };
+
+    // Prepare domain and evaluation functions
+    let domain_size = n.next_power_of_two();
+    let vanishing_domain_for_fs = generate_evaluation_domain(domain_size, Scalar::ONE);
+    let vanishing_roots_for_fs: Vec<Scalar> = vanishing_domain_for_fs.iter().take(n).copied().collect();
+
+    let mut b_bits_for_fs = vec![0u8; n];
+    for &i in &signing_set {
+        if i < n {
+            b_bits_for_fs[i] = 1;
+        }
+    }
+
+    let lagrange_at_fs = |i: usize, n: usize, x: Scalar| -> Scalar {
+        LagrangeInterpolation::lagrange_at(i, n, &vanishing_roots_for_fs, x)
+    };
+
+    let z_of_fs = |x: Scalar| -> Scalar {
+        let mut result = Scalar::ONE;
+        for j in 0..n {
+            result *= x - vanishing_roots_for_fs[j];
+        }
+        result
+    };
+
+    // Verify all three equations at FS challenge r
+    let fs_valid = verify_equations_at_fs_challenge(
+        ro2_inputs,
+        n,
+        &vanishing_roots_for_fs,
+        &b_bits_for_fs,
+        &weights_for_check,
+        &all_pks_for_qz,
+        lagrange_at_fs,
+        z_of_fs,
+    );
+
+    if !fs_valid {
+        println!("\n❌ FATAL: Fiat-Shamir challenge verification failed!");
+        println!("Cannot proceed with aggregation.");
+        return;
+    }
+
+    println!("\n═══════════════════════════════════════════════════════════\n");
+
     // Aggregation with Proof Generation
     println!("🔗 Aggregation:");
     let aggregator = Aggregator::new(ts.generator);
@@ -703,7 +814,7 @@ mod tests {
         // Placeholder Q_x(r)
         let qx_at_r = G1Projective::identity();
 
-        let (qz_rG, binding_hash) = verify_qz_onepoint_diagnostic(
+        let (_qz_rG, binding_hash) = verify_qz_onepoint_diagnostic(
             &signing_set,
             &pks,
             n,
@@ -713,5 +824,76 @@ mod tests {
 
         assert_eq!(binding_hash.len(), 32, "Binding hash should be 32 bytes");
         println!("✓ Q_Z one-point test passed!");
+    }
+
+    #[test]
+    fn test_fs_challenge_integration() {
+        use rand::thread_rng;
+
+        let mut rng = thread_rng();
+        let ts = ThresholdSignature::new();
+        let n = 5;
+        let signing_set = vec![0, 1, 2];
+
+        // Generate keys
+        let pks: Vec<G1Projective> = (0..n)
+            .map(|_| {
+                let sk = Scalar::random(&mut rng);
+                ts.generator * sk
+            })
+            .collect();
+
+        let weights: Vec<Scalar> = (1..=n)
+            .map(|i| Scalar::from(i as u64))
+            .collect();
+
+        let mut b_bits = vec![0u8; n];
+        for &i in &signing_set {
+            if i < n {
+                b_bits[i] = 1;
+            }
+        }
+
+        // Create RO2 inputs
+        let ro2_inputs = RO2Inputs {
+            hcom_sk: [1u8; 32],
+            com_w: [2u8; 32],
+            com_b: [3u8; 32],
+            hcom_qx: [4u8; 32],
+            com_qx_p: [5u8; 32],
+            com_qz_p: [6u8; 32],
+            com_q: [7u8; 32],
+            qz_scheme_label: b"QZ_ONEPOINT_V1",
+        };
+
+        let domain_size = n.next_power_of_two();
+        let vanishing_domain = generate_evaluation_domain(domain_size, Scalar::ONE);
+        let vanishing_roots: Vec<Scalar> = vanishing_domain.iter().take(n).copied().collect();
+
+        let lagrange_at_fs = |i: usize, n: usize, x: Scalar| -> Scalar {
+            LagrangeInterpolation::lagrange_at(i, n, &vanishing_roots, x)
+        };
+
+        let z_of_fs = |x: Scalar| -> Scalar {
+            let mut result = Scalar::ONE;
+            for j in 0..n {
+                result *= x - vanishing_roots[j];
+            }
+            result
+        };
+
+        let result = verify_equations_at_fs_challenge(
+            ro2_inputs,
+            n,
+            &vanishing_roots,
+            &b_bits,
+            &weights,
+            &pks,
+            lagrange_at_fs,
+            z_of_fs,
+        );
+
+        assert!(result, "FS challenge verification should pass");
+        println!("✓ FS challenge integration test passed!");
     }
 }
