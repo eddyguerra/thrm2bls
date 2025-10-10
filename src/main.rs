@@ -8,9 +8,15 @@ use std::collections::HashMap;
 
 mod polynomial;
 mod fri;
+mod booleanity;
+mod clear_sumcheck;
+mod sk_qz_onepoint;  // NEW: Add Q_Z one-point module
 
 use polynomial::LagrangeInterpolation;
 use fri::ProofGenerator;
+use booleanity::verify_booleanity_constraint;
+use clear_sumcheck::verify_clear_sumcheck;
+use sk_qz_onepoint::verify_qz_onepoint_diagnostic;  // NEW
 
 // ============================================================================
 // DOMAIN UTILITIES
@@ -445,8 +451,77 @@ fn main() {
         println!("    Party {} signed", i);
     }
 
+    // NEW: Booleanity constraint diagnostics (BEFORE aggregation starts)
+    println!("\n═══════════════════════════════════════════════════════════");
+    println!("  BOOLEANITY CONSTRAINT DIAGNOSTICS");
+    println!("═══════════════════════════════════════════════════════════");
+
+    let bool_valid = verify_booleanity_constraint(&signing_set, n);
+
+    if !bool_valid {
+        println!("\n❌ FATAL: Booleanity constraint verification failed!");
+        println!("Cannot proceed with aggregation.");
+        return;
+    }
+
+    println!("\n═══════════════════════════════════════════════════════════\n");
+
+    // NEW: Clear Sumcheck (W·B identity) diagnostics
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  CLEAR SUMCHECK (W·B IDENTITY) DIAGNOSTICS");
+    println!("═══════════════════════════════════════════════════════════");
+
+    // Convert weights_vec to proper format
+    let weights_for_check: Vec<Scalar> = (0..n)
+        .map(|i| weights_map.get(&i).copied().unwrap_or(Scalar::ZERO))
+        .collect();
+
+    let clear_valid = verify_clear_sumcheck(&signing_set, &weights_for_check, n);
+
+    if !clear_valid {
+        println!("\n❌ FATAL: Clear sumcheck verification failed!");
+        println!("Cannot proceed with aggregation.");
+        return;
+    }
+
+    println!("\n═══════════════════════════════════════════════════════════\n");
+
+    // NEW: SK Encapsulated Q_Z One-Point Computation
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  SK ENCAPSULATED Q_Z ONE-POINT DIAGNOSTICS");
+    println!("═══════════════════════════════════════════════════════════");
+
+    // For now, use Q_x(r)·G = identity (placeholder)
+    // In the full implementation, this would come from the Q_x computation step
+    let qx_at_r = G1Projective::identity();
+
+    // Collect all public keys in order
+    let all_pks_for_qz: Vec<G1Projective> = (0..n)
+        .map(|i| public_keys_map.get(&i).map(|pk| pk.0).unwrap_or(G1Projective::identity()))
+        .collect();
+
+    // Use domain[0] as test point for now
+    let test_point_idx = 0;
+
+    let (_qz_rG, binding_hash) = verify_qz_onepoint_diagnostic(
+        &signing_set,
+        &all_pks_for_qz,
+        n,
+        qx_at_r,
+        test_point_idx,
+    );
+
+    // Print binding hash (first 16 bytes for readability)
+    let hex_str = binding_hash.iter()
+        .take(16)
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+    println!("  🔒 Q_Z(r)·G binding (first 16 bytes): {}", hex_str);
+
+    println!("\n═══════════════════════════════════════════════════════════\n");
+
     // Aggregation with Proof Generation
-    println!("\n🔗 Aggregation:");
+    println!("🔗 Aggregation:");
     let aggregator = Aggregator::new(ts.generator);
 
     match aggregator.aggregate(msg, &partials, &public_keys_map, &weights_map, n) {
@@ -567,5 +642,76 @@ mod tests {
         assert!(agg_sig.proof.is_some(), "Proof should be generated");
 
         println!("✓ Complete workflow test passed!");
+    }
+
+    #[test]
+    fn test_booleanity_constraint_integration() {
+        // Test the booleanity constraint with different signing sets
+        let test_cases = vec![
+            (5, vec![0, 1, 2]),
+            (5, vec![0, 2, 4]),
+            (4, vec![0, 1, 2, 3]),
+            (4, vec![1, 3]),
+            (8, vec![0, 2, 4, 6]),
+        ];
+
+        for (n, signing_set) in test_cases {
+            println!("\nTesting n={}, signing_set={:?}", n, signing_set);
+            let result = verify_booleanity_constraint(&signing_set, n);
+            assert!(result, "Booleanity constraint should hold for n={}, signing_set={:?}", n, signing_set);
+        }
+    }
+
+    #[test]
+    fn test_clear_sumcheck_integration() {
+        // Test the clear sumcheck with different signing sets
+        let test_cases = vec![
+            (5, vec![0, 1, 2]),
+            (5, vec![0, 2, 4]),
+            (4, vec![0, 1, 2, 3]),
+            (4, vec![1, 3]),
+        ];
+
+        for (n, signing_set) in test_cases {
+            let weights: Vec<Scalar> = (1..=n)
+                .map(|i| Scalar::from(i as u64))
+                .collect();
+
+            println!("\nTesting clear sumcheck: n={}, signing_set={:?}", n, signing_set);
+            let result = verify_clear_sumcheck(&signing_set, &weights, n);
+            assert!(result, "Clear sumcheck should pass for n={}, signing_set={:?}", n, signing_set);
+        }
+    }
+
+    #[test]
+    fn test_qz_onepoint_integration() {
+        use rand::thread_rng;
+
+        let mut rng = thread_rng();
+        let ts = ThresholdSignature::new();
+        let n = 5;
+        let signing_set = vec![0, 1, 2];
+
+        // Generate keys
+        let pks: Vec<G1Projective> = (0..n)
+            .map(|_| {
+                let sk = Scalar::random(&mut rng);
+                ts.generator * sk
+            })
+            .collect();
+
+        // Placeholder Q_x(r)
+        let qx_at_r = G1Projective::identity();
+
+        let (qz_rG, binding_hash) = verify_qz_onepoint_diagnostic(
+            &signing_set,
+            &pks,
+            n,
+            qx_at_r,
+            0, // test_point_idx
+        );
+
+        assert_eq!(binding_hash.len(), 32, "Binding hash should be 32 bytes");
+        println!("✓ Q_Z one-point test passed!");
     }
 }

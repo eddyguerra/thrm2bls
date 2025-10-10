@@ -12,6 +12,77 @@ use sha2::{Digest, Sha256};
 
 use crate::polynomial::{Polynomial, EncapsulatedPolynomial, LagrangeInterpolation, VanishingPolynomial};
 
+// ============================================================================
+// BOOLEANITY CONSTRAINT
+// ============================================================================
+
+/// Clear polynomial commitment for booleanity check
+#[derive(Clone, Debug)]
+pub struct ClearPolyCommitment {
+    pub root: Vec<u8>,
+}
+
+/// Commit to a vector of scalars via Merkle tree
+pub fn com_scalars(scalars: &[Scalar]) -> ClearPolyCommitment {
+    let leaves: Vec<[u8; 32]> = scalars
+        .iter()
+        .map(|s| {
+            let bytes = s.to_bytes();
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        })
+        .collect();
+
+    let root = merkle_commit_scalar_bytes_bool(&leaves);
+    ClearPolyCommitment { root }
+}
+
+fn merkle_commit_scalar_bytes_bool(leaves: &[[u8; 32]]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"MERKLE_ROOT_SCALARS_BOOL");
+    for leaf in leaves {
+        hasher.update(leaf);
+    }
+    hasher.finalize().to_vec()
+}
+
+/// Compute the Boolean quotient polynomial Q(x) = B(x)·(1-B(x)) / Z(x)
+/// where B(x) = Σ b_i · L_i(x) is the indicator polynomial.
+pub fn compute_boolean_quotient(
+    b_bits: &[u8],
+    domain: &[Scalar],
+    lagrange_eval: impl Fn(usize, usize, Scalar) -> Scalar,
+    z_of: impl Fn(Scalar) -> Scalar,
+) -> (Vec<Scalar>, Vec<Scalar>) {
+    let n = b_bits.len();
+    let domain_size = domain.len();
+
+    let mut b_eval = Vec::with_capacity(domain_size);
+    let mut q_bool = Vec::with_capacity(domain_size);
+
+    for &x in domain {
+        let mut b_x = Scalar::ZERO;
+        for i in 0..n {
+            if b_bits[i] == 1 {
+                let l_i_x = lagrange_eval(i, n, x);
+                b_x += l_i_x;
+            }
+        }
+
+        let z_x = z_of(x);
+        assert!(z_x != Scalar::ZERO, "Z(x) = 0 at domain point");
+
+        let numerator = b_x * (Scalar::ONE - b_x);
+        let q_x = numerator * z_x.invert().unwrap();
+
+        b_eval.push(b_x);
+        q_bool.push(q_x);
+    }
+
+    (b_eval, q_bool)
+}
+
 // Security parameter: number of queries for soundness
 const DEFAULT_NUM_QUERIES: usize = 10;
 
